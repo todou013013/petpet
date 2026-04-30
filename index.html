@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>寵物管理系統 V3 - Google Sheets 同步版</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <style>
+        :root { --bg: #f8f9fa; --primary: #5d5fef; --success: #2ecc71; --danger: #e74c3c; --card: #ffffff; }
+        body { font-family: sans-serif; background: var(--bg); padding: 20px; line-height: 1.6; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .card { background: var(--card); padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; }
+        .input-group { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; }
+        input, select, button { padding: 10px; border: 1px solid #ddd; border-radius: 8px; }
+        button { cursor: pointer; background: var(--primary); color: white; border: none; font-weight: bold; }
+        button:disabled { background: #ccc; }
+        .tag { display: inline-block; background: #e0e7ff; color: #4338ca; padding: 4px 10px; border-radius: 6px; margin: 0 5px 5px 0; font-size: 13px; }
+        .pet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+        .pet-card { position: relative; border-left: 5px solid var(--primary); }
+        .pet-card.neutered { filter: grayscale(1); opacity: 0.6; border-left-color: #95a5a6; }
+        .rarity-badge { float: right; font-size: 11px; padding: 2px 8px; border-radius: 4px; background: #eee; }
+        .sync-status { font-size: 12px; color: #666; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div id="app" class="container">
+        <header class="card header">
+            <h1>🐾 寵物共享管理 (同步版)</h1>
+            <div>
+                <button @click="fetchData" :disabled="loading">🔄 重新讀取數據</button>
+                <button @click="weeklyReset" style="background: var(--danger); margin-left:10px;">⏳ 每週重置</button>
+            </div>
+        </header>
+
+        <!-- 設定區 -->
+        <div class="card" v-if="!scriptUrl">
+            <h3 style="color: var(--danger)">⚠️ 尚未設定資料庫網址</h3>
+            <p>請貼入您的 Google Apps Script 網頁應用程式 URL：</p>
+            <input v-model="inputUrl" placeholder="https://script.google.com/macros/s/.../exec" style="width: 80%">
+            <button @click="saveUrl">儲存設定</button>
+        </div>
+
+        <!-- 角色選取與新增區 -->
+        <div class="card" v-else>
+            <div class="filter-section" style="margin-bottom: 20px;">
+                <strong>🔍 查看角色：</strong>
+                <select v-model="selectedOwner" style="min-width: 200px;">
+                    <option value="ALL">全部角色</option>
+                    <option v-for="owner in owners" :key="owner" :value="owner">{{ owner }}</option>
+                </select>
+                <span class="sync-status"> | 狀態：{{ loading ? '同步中...' : '已連線' }}</span>
+            </div>
+
+            <hr>
+
+            <div style="margin-top: 20px;">
+                <strong>➕ 登記新寵物：</strong>
+                <div class="input-group">
+                    <input v-model="form.owner" placeholder="持有角色名稱">
+                    <input v-model="form.name" placeholder="寵物名稱">
+                    <select v-model="form.rarity">
+                        <option value="普通">普通 (2次)</option>
+                        <option value="典藏">典藏 (3次)</option>
+                        <option value="典藏珍">典藏珍 (4次)</option>
+                    </select>
+                    <button @click="addPet" :disabled="loading">加入並同步</button>
+                </div>
+                <div class="input-group">
+                    <input v-model="newTagName" placeholder="新詞條名稱">
+                    <button @click="addTag" style="background: #666;">新增詞條分類</button>
+                </div>
+                <div>
+                    <small>選擇詞條：</small>
+                    <label v-for="tag in tags" :key="tag" style="margin-right: 10px; font-size: 13px;">
+                        <input type="checkbox" :value="tag" v-model="form.selectedTags"> {{ tag }}
+                    </label>
+                </div>
+            </div>
+        </div>
+
+        <!-- 列表區 -->
+        <h2>{{ selectedOwner === 'ALL' ? '🌍 全服寵物' : '👤 ' + selectedOwner + ' 的寵物' }}</h2>
+        <div class="pet-grid">
+            <div v-for="pet in filteredPets" :key="pet.id" :class="['card', 'pet-card', { neutered: pet.remaining <= 0 }]">
+                <span class="rarity-badge">{{ pet.rarity }}</span>
+                <h3>{{ pet.name }}</h3>
+                <p>角色：<strong>{{ pet.owner }}</strong></p>
+                <div style="margin-bottom: 15px;">
+                    <span v-for="t in pet.tags" class="tag">{{ t }}</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span>剩餘配對：<strong>{{ pet.remaining }}</strong></span>
+                    <button v-if="pet.remaining > 0" @click="doMatch(pet)" style="background: var(--success);">配對</button>
+                    <span v-else style="color: var(--danger); font-weight: bold;">🚫 本週絕育</span>
+                </div>
+                <button @click="deletePet(pet.id)" style="width: 100%; margin-top: 15px; background: none; color: #ccc; border: 1px solid #eee;">刪除</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp } = Vue;
+        createApp({
+            data() {
+                return {
+                    loading: false,
+                    scriptUrl: 'https://script.google.com/macros/s/AKfycbxUZnrRaXE2cqBM0dCp7RhpQOOYvyrdyMHNEtGJK6gSS-1sau6YeszaAMFDmmX_Ptb1SA/exec',
+                    inputUrl: '',
+                    selectedOwner: 'ALL',
+                    pets: [],
+                    tags: [],
+                    newTagName: '',
+                    form: { owner: '', name: '', rarity: '普通', selectedTags: [] }
+                }
+            },
+            computed: {
+                owners() {
+                    return [...new Set(this.pets.map(p => p.owner))];
+                },
+                filteredPets() {
+                    let list = this.selectedOwner === 'ALL' ? this.pets : this.pets.filter(p => p.owner === this.selectedOwner);
+                    return list.sort((a, b) => (b.remaining > 0) - (a.remaining > 0));
+                }
+            },
+            methods: {
+                async syncToSheet() {
+                    if (!this.scriptUrl) return;
+                    this.loading = true;
+                    try {
+                        await fetch(this.scriptUrl, {
+                            method: 'POST',
+                            mode: 'no-cors',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action: 'sync', pets: this.pets, tags: this.tags })
+                        });
+                        // 延遲一下再重新抓取確保資料已更新
+                        setTimeout(this.fetchData, 1000);
+                    } catch (e) { alert('同步失敗'); }
+                    finally { this.loading = false; }
+                },
+                async fetchData() {
+                    if (!this.scriptUrl) return;
+                    this.loading = true;
+                    try {
+                        const res = await fetch(this.scriptUrl);
+                        const data = await res.json();
+                        this.pets = data.pets;
+                        this.tags = data.tags;
+                    } catch (e) { console.error('抓取失敗'); }
+                    finally { this.loading = false; }
+                },
+                saveUrl() {
+                    if (this.inputUrl.includes('exec')) {
+                        this.scriptUrl = this.inputUrl;
+                        localStorage.setItem('gas_url', this.inputUrl);
+                        this.fetchData();
+                    } else { alert('無效的 URL'); }
+                },
+                getMax(rarity) {
+                    return { '普通': 2, '典藏': 3, '典藏珍': 4 }[rarity] || 2;
+                },
+                addPet() {
+                    const newPet = {
+                        id: Date.now().toString(),
+                        owner: this.form.owner,
+                        name: this.form.name,
+                        rarity: this.form.rarity,
+                        tags: [...this.form.selectedTags],
+                        remaining: this.getMax(this.form.rarity)
+                    };
+                    this.pets.push(newPet);
+                    this.syncToSheet();
+                },
+                doMatch(pet) {
+                    pet.remaining--;
+                    this.syncToSheet();
+                },
+                deletePet(id) {
+                    this.pets = this.pets.filter(p => p.id !== id);
+                    this.syncToSheet();
+                },
+                addTag() {
+                    if (this.newTagName && !this.tags.includes(this.newTagName)) {
+                        this.tags.push(this.newTagName);
+                        this.newTagName = '';
+                        this.syncToSheet();
+                    }
+                },
+                weeklyReset() {
+                    this.pets.forEach(p => p.remaining = this.getMax(p.rarity));
+                    this.syncToSheet();
+                }
+            },
+            mounted() {
+                if (this.scriptUrl) this.fetchData();
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
